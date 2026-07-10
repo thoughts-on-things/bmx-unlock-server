@@ -107,7 +107,7 @@ func main() {
 		unlockDurationSec: unlockDurationSec,
 		arrivalLogPath:    arrivalLogPath,
 		sequence: []unlockStep{
-			{doorID: 13723, name: "Front Door", delay: 0, reLockInterval: 9 * time.Second, holdDuration: 30 * time.Second}, // hardware lock: 10s; user clears front gate well within 30s
+			{doorID: 13723, name: "Front Door", delay: 0, reLockInterval: 9 * time.Second, holdDuration: 60 * time.Second}, // hardware lock: 10s; 60s covers worst-case walk from zone trigger to front gate
 			{doorID: 15238, name: "2nd Gate", delay: 0, reLockInterval: 17 * time.Second},                                 // hardware lock: 20s; holds for full unlockDuration
 		},
 		approach: approachState{wasOutside: true},
