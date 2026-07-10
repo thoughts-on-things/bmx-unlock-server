@@ -27,6 +27,7 @@ type unlockStep struct {
 	name           string
 	delay          time.Duration
 	reLockInterval time.Duration // how often to re-unlock during hold; must be < hardware lock duration
+	holdDuration   time.Duration // how long to hold this door open; 0 means use global unlockDuration
 }
 
 // approachState tracks geofence and in-flight unlock state.
@@ -106,8 +107,8 @@ func main() {
 		unlockDurationSec: unlockDurationSec,
 		arrivalLogPath:    arrivalLogPath,
 		sequence: []unlockStep{
-			{doorID: 13723, name: "Front Door", delay: 0, reLockInterval: 9 * time.Second},  // hardware lock: 10s
-			{doorID: 15238, name: "2nd Gate", delay: 0, reLockInterval: 17 * time.Second}, // hardware lock: 20s
+			{doorID: 13723, name: "Front Door", delay: 0, reLockInterval: 9 * time.Second, holdDuration: 30 * time.Second}, // hardware lock: 10s; user clears front gate well within 30s
+			{doorID: 15238, name: "2nd Gate", delay: 0, reLockInterval: 17 * time.Second},                                 // hardware lock: 20s; holds for full unlockDuration
 		},
 		approach: approachState{wasOutside: true},
 	}
@@ -484,10 +485,14 @@ func (s *server) startSequence() {
 				slog.Error("unlock failed", "door", step.name, "err", err)
 			}
 
-			// Hold this door open by re-unlocking on a ticker for unlockDuration.
+			// Hold this door open by re-unlocking on a ticker for its hold duration.
 			wg.Add(1)
 			step := step
-			holdCtx, holdCancel := context.WithTimeout(ctx, unlockDuration)
+			doorHold := unlockDuration
+			if step.holdDuration > 0 {
+				doorHold = step.holdDuration
+			}
+			holdCtx, holdCancel := context.WithTimeout(ctx, doorHold)
 			go func() {
 				defer wg.Done()
 				defer holdCancel()
