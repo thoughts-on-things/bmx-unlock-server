@@ -82,10 +82,16 @@ func main() {
 	client := butterflymx.NewAPIClient(butterflymx.APIStaticToken(apiToken), nil)
 
 	ctx := context.Background()
-	tenantID, tenantTagID, err := resolveTenant(ctx, client)
-	if err != nil {
-		slog.Error("failed to resolve tenant", "err", err)
-		os.Exit(1)
+	var tenantID butterflymx.ID
+	var tenantTagID butterflymx.TaggedID
+	for {
+		var err error
+		tenantID, tenantTagID, err = resolveTenant(ctx, client)
+		if err == nil {
+			break
+		}
+		slog.Warn("failed to resolve tenant, retrying in 30s", "err", err)
+		time.Sleep(30 * time.Second)
 	}
 	slog.Info("tenant resolved", "id", tenantID)
 
