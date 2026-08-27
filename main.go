@@ -34,26 +34,38 @@ type unlockStep struct {
 type approachState struct {
 	mu             sync.Mutex
 	lastUnlockedAt time.Time
-	wasOutside     bool       // true when last known position was outside geofence
-	cancelSeq      func()     // cancels in-flight delayed unlock sequence, nil if none
+	wasOutside     bool   // true when last known position was outside geofence
+	cancelSeq      func() // cancels in-flight delayed unlock sequence, nil if none
 }
 
 type server struct {
-	client             *butterflymx.APIClient
-	tenantID           butterflymx.ID
-	tenantTagID        butterflymx.TaggedID
-	apiKey             string
-	homeLat            float64
-	homeLon            float64
-	radiusM            float64
-	cooldown           time.Duration
-	sequence           []unlockStep
-	approach           approachState
-	configMu           sync.RWMutex
-	gateDelaySec       float64
-	unlockDurationSec  float64
-	arrivalLogMu       sync.Mutex
-	arrivalLogPath     string
+	client            *butterflymx.APIClient
+	tenantID          butterflymx.ID
+	tenantTagID       butterflymx.TaggedID
+	apiKey            string
+	homeLat           float64
+	homeLon           float64
+	radiusM           float64
+	cooldown          time.Duration
+	sequence          []unlockStep
+	approach          approachState
+	configMu          sync.RWMutex
+	gateDelaySec      float64
+	unlockDurationSec float64
+	accuracyGateM     float64 // GPS accuracy gate (enforced in HA); tracked for tuning + logging
+	triggerRadiusM    float64 // arrival trigger radius (enforced in HA); tracked for tuning + logging
+	arrivalLogMu      sync.Mutex
+	arrivalLogPath    string
+
+	// event log + auto-tuner
+	eventLogMu     sync.Mutex
+	eventLogPath   string
+	tunerStatePath string
+	tuningLogPath  string
+	tuneInterval   time.Duration
+	tuneWindow     time.Duration
+	haURL          string
+	haToken        string // long-lived HA token; empty => tuner runs recommend-only
 }
 
 // OwnTracks HTTP-mode location payload (subset of fields we need).
@@ -78,6 +90,16 @@ func main() {
 	cooldownMin := floatEnvOr("COOLDOWN_MINUTES", 10)
 	gateDelaySec := floatEnvOr("GATE_DELAY_SECONDS", 30)
 	unlockDurationSec := floatEnvOr("UNLOCK_DURATION_SECONDS", 30)
+	accuracyGateM := floatEnvOr("ACCURACY_GATE_M", 100)
+	triggerRadiusM := floatEnvOr("TRIGGER_RADIUS_M", 100)
+
+	tuneIntervalH := floatEnvOr("TUNE_INTERVAL_HOURS", 6)
+	tuneWindowDays := floatEnvOr("TUNE_WINDOW_DAYS", 14)
+	haURL := os.Getenv("HA_URL")
+	if haURL == "" {
+		haURL = "http://localhost:8123"
+	}
+	haToken := os.Getenv("HA_TOKEN")
 
 	client := butterflymx.NewAPIClient(butterflymx.APIStaticToken(apiToken), nil)
 
@@ -99,6 +121,7 @@ func main() {
 	if p := os.Getenv("ARRIVAL_LOG_PATH"); p != "" {
 		arrivalLogPath = p
 	}
+	eventLogPath := envOr("EVENT_LOG_PATH", "events.csv")
 
 	s := &server{
 		client:            client,
@@ -111,18 +134,41 @@ func main() {
 		cooldown:          time.Duration(cooldownMin * float64(time.Minute)),
 		gateDelaySec:      gateDelaySec,
 		unlockDurationSec: unlockDurationSec,
+		accuracyGateM:     accuracyGateM,
+		triggerRadiusM:    triggerRadiusM,
 		arrivalLogPath:    arrivalLogPath,
+		eventLogPath:      eventLogPath,
+		tunerStatePath:    envOr("TUNER_STATE_PATH", "tuner_state.json"),
+		tuningLogPath:     envOr("TUNING_LOG_PATH", "tuning.log"),
+		tuneInterval:      time.Duration(tuneIntervalH * float64(time.Hour)),
+		tuneWindow:        time.Duration(tuneWindowDays * float64(24*time.Hour)),
+		haURL:             haURL,
+		haToken:           haToken,
 		sequence: []unlockStep{
 			{doorID: 13723, name: "Front Door", delay: 0, reLockInterval: 9 * time.Second, holdDuration: 90 * time.Second}, // hardware lock: 10s; 90s covers worst-case walk from zone trigger to front gate
-			{doorID: 15238, name: "2nd Gate", delay: 0, reLockInterval: 17 * time.Second},                                 // hardware lock: 20s; holds for full unlockDuration
+			{doorID: 15238, name: "2nd Gate", delay: 0, reLockInterval: 17 * time.Second},                                  // hardware lock: 20s; holds for full unlockDuration
 		},
 		approach: approachState{wasOutside: true},
 	}
+
+	// Upgrade any pre-iCloud3 events.csv to the current schema before writing.
+	s.ensureEventLogSchema()
+
+	// One-time backfill so the tuner has historical distance/accuracy stats.
+	s.seedEventsFromArrivals()
+
+	// Start the auto-tuner in the background.
+	tunerCtx, cancelTuner := context.WithCancel(context.Background())
+	defer cancelTuner()
+	go s.runTuner(tunerCtx)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /doors", s.auth(s.handleDoors))
 	mux.HandleFunc("GET /status", s.auth(s.handleStatus))
 	mux.HandleFunc("GET /arrivals", s.auth(s.handleArrivalsGet))
+	mux.HandleFunc("GET /events", s.auth(s.handleEventsGet))
+	mux.HandleFunc("GET /tuning", s.auth(s.handleTuning))
+	mux.HandleFunc("POST /tune/run", s.auth(s.handleTuneRun))
 	mux.HandleFunc("POST /unlock/sequence", s.auth(s.handleUnlockSequence))
 	mux.HandleFunc("POST /unlock/{doors}", s.auth(s.handleUnlock))
 	mux.HandleFunc("POST /location", s.auth(s.handleLocation))
@@ -137,7 +183,12 @@ func main() {
 		"radius_m", radiusM,
 		"gate_delay_s", gateDelaySec,
 		"unlock_duration_s", unlockDurationSec,
+		"accuracy_gate_m", accuracyGateM,
+		"trigger_radius_m", triggerRadiusM,
 		"cooldown_min", cooldownMin,
+		"tune_interval", s.tuneInterval.String(),
+		"tune_window", s.tuneWindow.String(),
+		"auto_apply", haToken != "",
 	)
 	if err := http.ListenAndServe(addr, mux); err != nil {
 		slog.Error("server stopped", "err", err)
@@ -210,6 +261,13 @@ func (s *server) handleUnlock(w http.ResponseWriter, r *http.Request) {
 	raw := r.PathValue("doors")
 	parts := strings.Split(raw, ",")
 
+	source := sourceOr(r, "manual_dashboard")
+	gateDelay, unlockDur, accGate, trigRad := s.configSnapshot()
+	s.logEvent(event{
+		ts: time.Now(), source: source, door: raw,
+		gateDelayS: gateDelay, unlockDurS: unlockDur, accGateM: accGate, trigRadM: trigRad,
+	})
+
 	type result struct {
 		DoorID string `json:"door_id"`
 		Status string `json:"status"`
@@ -243,18 +301,92 @@ func (s *server) handleUnlock(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, status, map[string]any{"results": results, "all_success": allOK})
 }
 
-// handleUnlockSequence triggers the configured approach sequence manually.
-// POST /unlock/sequence
+// handleUnlockSequence triggers the configured approach sequence.
+// POST /unlock/sequence?source=auto     (HA arrival automation; optional JSON
+//
+//	body {lat,lon,gps_accuracy,ha_zone_radius})
+//
+// POST /unlock/sequence?source=manual   (iOS shortcut / manual sequence)
+// The source is recorded in events.csv; a manual unlock shortly after an auto
+// fire is the tuner's failure signal.
 func (s *server) handleUnlockSequence(w http.ResponseWriter, r *http.Request) {
+	source := sourceOr(r, "manual")
+
+	// Optional position payload (sent by the auto path so the tuner can
+	// classify failures by distance-from-home). The auto path also includes an
+	// independent iCloud3 fix (icloud_*) as a second opinion for verification.
+	var body struct {
+		Lat               *float64 `json:"lat"`
+		Lon               *float64 `json:"lon"`
+		GPSAccuracy       float64  `json:"gps_accuracy"`
+		HAZoneRadius      float64  `json:"ha_zone_radius"`
+		IcloudLat         *float64 `json:"icloud_lat"`
+		IcloudLon         *float64 `json:"icloud_lon"`
+		IcloudGPSAccuracy float64  `json:"icloud_gps_accuracy"`
+		IcloudLastTS      float64  `json:"icloud_last_ts"` // epoch seconds of the iCloud3 fix
+	}
+	_ = json.NewDecoder(r.Body).Decode(&body) // best-effort; empty body is fine
+
+	gateDelay, unlockDur, accGate, trigRad := s.configSnapshot()
+	ev := event{
+		ts: time.Now(), source: source,
+		gateDelayS: gateDelay, unlockDurS: unlockDur, accGateM: accGate, trigRadM: trigRad,
+	}
+	if body.Lat != nil && body.Lon != nil {
+		ev.lat, ev.lon = *body.Lat, *body.Lon
+		ev.gpsAccuracy = body.GPSAccuracy
+		ev.zoneRadiusM = body.HAZoneRadius
+		ev.distanceM = haversineMeters(*body.Lat, *body.Lon, s.homeLat, s.homeLon)
+		ev.hasPos = true
+	}
+	// iCloud3 second opinion. lat/lon default to 0 when the tracker is
+	// unavailable; treat (0,0) as "no fix". Age is computed from the fix epoch.
+	if body.IcloudLat != nil && body.IcloudLon != nil && *body.IcloudLat != 0 && *body.IcloudLon != 0 {
+		ev.icloudLat, ev.icloudLon = *body.IcloudLat, *body.IcloudLon
+		ev.icloudAccuracy = body.IcloudGPSAccuracy
+		ev.icloudDistanceM = haversineMeters(*body.IcloudLat, *body.IcloudLon, s.homeLat, s.homeLon)
+		if body.IcloudLastTS > 0 {
+			ev.icloudAgeS = float64(time.Now().Unix()) - body.IcloudLastTS
+			if ev.icloudAgeS < 0 {
+				ev.icloudAgeS = 0
+			}
+		} else {
+			ev.icloudAgeS = icloudFreshWindow.Seconds() + 1 // unknown fix time => treat as stale
+		}
+		ev.hasIcloud = true
+		if ev.hasPos {
+			ev.srcDisagreeM = haversineMeters(ev.lat, ev.lon, *body.IcloudLat, *body.IcloudLon)
+		}
+	}
+	// Server-side iCloud3 veto: on an automated fire, if a FRESH iCloud3 fix (the
+	// more reliable source) clearly disagrees and says we're outside the trigger
+	// radius, the companion GPS glitched us home while still far — skip the unlock.
+	// Fails open: no veto when iCloud3 is stale, missing, or roughly agrees.
+	if source == "auto" && crossFresh(ev) && ev.srcDisagreeM > sourceDisagreeThresholdM && ev.icloudDistanceM > trigRad {
+		ev.source = "auto_vetoed"
+		s.logEvent(ev)
+		slog.Info("auto unlock vetoed by iCloud3 (companion GPS glitch)",
+			"companion_dist_m", math.Round(ev.distanceM),
+			"icloud_dist_m", math.Round(ev.icloudDistanceM),
+			"trigger_radius_m", trigRad,
+			"icloud_age_s", math.Round(ev.icloudAgeS))
+		writeJSON(w, http.StatusAccepted, map[string]any{
+			"message":              "vetoed: iCloud3 places you outside the trigger radius",
+			"source":               "auto_vetoed",
+			"companion_distance_m": math.Round(ev.distanceM),
+			"icloud_distance_m":    math.Round(ev.icloudDistanceM),
+		})
+		return
+	}
+
+	s.logEvent(ev)
+
 	s.startSequence()
-	s.configMu.RLock()
-	delay := s.gateDelaySec
-	duration := s.unlockDurationSec
-	s.configMu.RUnlock()
 	writeJSON(w, http.StatusAccepted, map[string]any{
 		"message":             "sequence started",
-		"gate_delay_sec":      delay,
-		"unlock_duration_sec": duration,
+		"source":              source,
+		"gate_delay_sec":      gateDelay,
+		"unlock_duration_sec": unlockDur,
 	})
 }
 
@@ -264,6 +396,8 @@ func (s *server) handleConfig(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		GateDelaySec      *float64 `json:"gate_delay_seconds"`
 		UnlockDurationSec *float64 `json:"unlock_duration_seconds"`
+		AccuracyGateM     *float64 `json:"gps_accuracy_max"`
+		TriggerRadiusM    *float64 `json:"gate_trigger_radius"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON"})
@@ -277,6 +411,14 @@ func (s *server) handleConfig(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "unlock_duration_seconds must be > 0"})
 		return
 	}
+	if body.AccuracyGateM != nil && *body.AccuracyGateM <= 0 {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "gps_accuracy_max must be > 0"})
+		return
+	}
+	if body.TriggerRadiusM != nil && *body.TriggerRadiusM <= 0 {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "gate_trigger_radius must be > 0"})
+		return
+	}
 	s.configMu.Lock()
 	if body.GateDelaySec != nil {
 		s.gateDelaySec = *body.GateDelaySec
@@ -284,13 +426,25 @@ func (s *server) handleConfig(w http.ResponseWriter, r *http.Request) {
 	if body.UnlockDurationSec != nil {
 		s.unlockDurationSec = *body.UnlockDurationSec
 	}
+	if body.AccuracyGateM != nil {
+		s.accuracyGateM = *body.AccuracyGateM
+	}
+	if body.TriggerRadiusM != nil {
+		s.triggerRadiusM = *body.TriggerRadiusM
+	}
 	gateDelay := s.gateDelaySec
 	unlockDuration := s.unlockDurationSec
+	accGate := s.accuracyGateM
+	trigRad := s.triggerRadiusM
 	s.configMu.Unlock()
-	slog.Info("config updated", "gate_delay_seconds", gateDelay, "unlock_duration_seconds", unlockDuration)
+	slog.Info("config updated",
+		"gate_delay_seconds", gateDelay, "unlock_duration_seconds", unlockDuration,
+		"gps_accuracy_max", accGate, "gate_trigger_radius", trigRad)
 	writeJSON(w, http.StatusOK, map[string]any{
 		"gate_delay_seconds":      gateDelay,
 		"unlock_duration_seconds": unlockDuration,
+		"gps_accuracy_max":        accGate,
+		"gate_trigger_radius":     trigRad,
 	})
 }
 
@@ -383,6 +537,41 @@ func (s *server) handleArrivalsGet(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, out)
 }
 
+// handleEventsGet returns events.csv as a JSON array for inspection.
+// GET /events
+func (s *server) handleEventsGet(w http.ResponseWriter, r *http.Request) {
+	s.eventLogMu.Lock()
+	f, err := os.Open(s.eventLogPath)
+	s.eventLogMu.Unlock()
+	if os.IsNotExist(err) {
+		writeJSON(w, http.StatusOK, []any{})
+		return
+	}
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "could not open log"})
+		return
+	}
+	defer f.Close()
+
+	rows, err := csv.NewReader(f).ReadAll()
+	if err != nil || len(rows) < 2 {
+		writeJSON(w, http.StatusOK, []any{})
+		return
+	}
+	headers := rows[0]
+	out := make([]map[string]string, 0, len(rows)-1)
+	for _, row := range rows[1:] {
+		m := make(map[string]string, len(headers))
+		for i, h := range headers {
+			if i < len(row) {
+				m[h] = row[i]
+			}
+		}
+		out = append(out, m)
+	}
+	writeJSON(w, http.StatusOK, out)
+}
+
 // handleLocation receives OwnTracks HTTP-mode pings and triggers geofenced unlocks.
 // POST /location  (set OwnTracks → HTTP → URL to this endpoint)
 func (s *server) handleLocation(w http.ResponseWriter, r *http.Request) {
@@ -422,6 +611,12 @@ func (s *server) handleLocation(w http.ResponseWriter, r *http.Request) {
 				"cooldown_remaining", s.cooldown-time.Since(lastUnlocked))
 		} else {
 			slog.Info("geofence entered — starting unlock sequence")
+			gateDelay, unlockDur, accGate, trigRad := s.configSnapshot()
+			s.logEvent(event{
+				ts: time.Now(), source: "geofence",
+				lat: payload.Lat, lon: payload.Lon, distanceM: dist, hasPos: true,
+				gateDelayS: gateDelay, unlockDurS: unlockDur, accGateM: accGate, trigRadM: trigRad,
+			})
 			s.startSequence()
 		}
 
@@ -616,6 +811,21 @@ func mustFloat(key string) float64 {
 		os.Exit(1)
 	}
 	return v
+}
+
+func envOr(key, def string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return def
+}
+
+// sourceOr returns the ?source= query param, or def if absent.
+func sourceOr(r *http.Request, def string) string {
+	if v := r.URL.Query().Get("source"); v != "" {
+		return v
+	}
+	return def
 }
 
 func floatEnvOr(key string, def float64) float64 {
