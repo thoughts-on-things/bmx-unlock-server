@@ -21,7 +21,7 @@ go test ./...
 
 ## Configuration
 
-Set these as environment variables or in a `.env` file. Don't commit `.env`.
+Set these as environment variables or in a `.env` file (`cp .env.example .env`). Don't commit `.env`.
 
 | Variable | Required | Default | Purpose |
 |---|---|---|---|
