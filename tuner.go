@@ -62,11 +62,6 @@ var caps = map[string]leverCap{
 	"trigger_radius":  {min: 60, max: 200, step: 20},
 }
 
-// secondGateDoorID is the ButterflyMX door ID of the 2nd gate. A manual_dashboard
-// unlock of this door shortly after an auto fire, but before the 2nd gate's
-// staggered (gate_delay) unlock, means the gate opened too late for the arrival.
-const secondGateDoorID = "15238"
-
 // leverCooldown is the minimum time between changes to the same lever, so the
 // controller observes the effect of a change before making another.
 const leverCooldown = 24 * time.Hour
@@ -286,7 +281,10 @@ func (s *server) readEvents() ([]event, error) {
 
 // analyze computes window statistics and failure labels from the event log.
 // window bounds how far back to look; only auto/manual events are considered.
-func analyze(events []event, window time.Duration, now time.Time, accGate float64) analysis {
+// secondGateID is the door staggered by gate_delay ("" if none): a
+// manual_dashboard unlock of it after an auto fire, but before its delayed
+// unlock, means the gate opened too late for the arrival.
+func analyze(events []event, window time.Duration, now time.Time, accGate float64, secondGateID string) analysis {
 	cutoff := now.Add(-window)
 	var autos, manuals []event
 	vetoed := 0
@@ -335,7 +333,7 @@ func analyze(events []event, window time.Duration, now time.Time, accGate float6
 		// (gate_delay) auto-unlock is not a "hold too short" failure — the gate
 		// just opened too late for how fast you reached it. Route it to gate_delay.
 		gap := m.ts.Sub(matched.ts).Seconds()
-		if m.source == "manual_dashboard" && m.door == secondGateDoorID && gap < matched.gateDelayS {
+		if m.source == "manual_dashboard" && secondGateID != "" && m.door == secondGateID && gap < matched.gateDelayS {
 			a.GateLateFails++
 			continue
 		}
@@ -535,7 +533,7 @@ func (s *server) tuneOnce(ctx context.Context) (analysis, []adjustment) {
 	gateDelay, unlockDur, accGate, trigRad := s.configSnapshot()
 
 	window := s.tuneWindow
-	a := analyze(events, window, now, accGate)
+	a := analyze(events, window, now, accGate, s.secondGateID())
 
 	st := s.loadTunerState()
 	adj := decide(a, gateDelay, unlockDur, accGate, trigRad, st, now)
@@ -681,7 +679,7 @@ func dryRunTag(applied bool, token string) string {
 func (s *server) handleTuning(w http.ResponseWriter, r *http.Request) {
 	events, _ := s.readEvents()
 	_, _, accGate, _ := s.configSnapshot()
-	a := analyze(events, s.tuneWindow, time.Now(), accGate)
+	a := analyze(events, s.tuneWindow, time.Now(), accGate, s.secondGateID())
 	st := s.loadTunerState()
 	gateDelay, unlockDur, accG, trigRad := s.configSnapshot()
 	writeJSON(w, http.StatusOK, map[string]any{

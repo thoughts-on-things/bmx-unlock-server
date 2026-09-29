@@ -7,6 +7,9 @@ import (
 	"time"
 )
 
+// testSecondGate is the door ID the tests treat as the gate_delay-staggered door.
+const testSecondGate = "1002"
+
 func ev(t time.Time, source string, dist, acc float64, hasPos bool) event {
 	return event{ts: t, source: source, distanceM: dist, gpsAccuracy: acc, hasPos: hasPos}
 }
@@ -30,7 +33,7 @@ func TestAnalyzeClassifiesFailures(t *testing.T) {
 		ev(mkt(60), "manual", 0, 0, false),
 	}
 
-	a := analyze(events, 14*24*time.Hour, now, 100)
+	a := analyze(events, 14*24*time.Hour, now, 100, testSecondGate)
 	if a.Autos != 4 {
 		t.Errorf("autos = %d, want 4", a.Autos)
 	}
@@ -149,8 +152,8 @@ func TestAnalyzeGateLateReclassified(t *testing.T) {
 	// later (well before its delayed unlock) -> gate_late, not close.
 	auto := ev(sAgo(300), "auto", 60, 12, true)
 	auto.gateDelayS = 15
-	manual := event{ts: sAgo(299), source: "manual_dashboard", door: "15238"}
-	a := analyze([]event{auto, manual}, 24*time.Hour, now, 100)
+	manual := event{ts: sAgo(299), source: "manual_dashboard", door: testSecondGate}
+	a := analyze([]event{auto, manual}, 24*time.Hour, now, 100, testSecondGate)
 	if a.GateLateFails != 1 {
 		t.Errorf("gate_late = %d, want 1", a.GateLateFails)
 	}
@@ -169,8 +172,8 @@ func TestAnalyzeGateTapAfterDelayIsCloseFail(t *testing.T) {
 	// re-tap is a genuine relock/hold issue, classified close (not gate_late).
 	auto := ev(sAgo(300), "auto", 60, 12, true)
 	auto.gateDelayS = 4
-	manual := event{ts: sAgo(280), source: "manual_dashboard", door: "15238"}
-	a := analyze([]event{auto, manual}, 24*time.Hour, now, 100)
+	manual := event{ts: sAgo(280), source: "manual_dashboard", door: testSecondGate}
+	a := analyze([]event{auto, manual}, 24*time.Hour, now, 100, testSecondGate)
 	if a.GateLateFails != 0 {
 		t.Errorf("gate_late = %d, want 0", a.GateLateFails)
 	}
@@ -202,7 +205,7 @@ func TestAnalyzeCountsEarlyAndVetoed(t *testing.T) {
 	// early fire: companion 90m, fresh iCloud3 says 320m (disagree 250)
 	early := withIcloud(ev(sAgo(600), "auto", 90, 12, true), 320, 250, 60)
 	vetoed := ev(sAgo(500), "auto_vetoed", 0, 0, false)
-	a := analyze([]event{early, vetoed}, 24*time.Hour, now, 100)
+	a := analyze([]event{early, vetoed}, 24*time.Hour, now, 100, testSecondGate)
 	if a.EarlyFires != 1 {
 		t.Errorf("early_fires = %d, want 1", a.EarlyFires)
 	}
@@ -275,7 +278,7 @@ func TestAnalyzeIcloudDisagreementReclassifiesFar(t *testing.T) {
 	auto := withIcloud(ev(mkt(200), "auto", 80, 12, true), 400, 320, 60)
 	events := []event{auto, ev(mkt(197), "manual", 0, 0, false)}
 
-	a := analyze(events, 14*24*time.Hour, now, 100)
+	a := analyze(events, 14*24*time.Hour, now, 100, testSecondGate)
 	if a.FarFails != 1 {
 		t.Errorf("far fails = %d, want 1 (reclassified via iCloud3)", a.FarFails)
 	}
@@ -295,7 +298,7 @@ func TestAnalyzeIcloudAgreementKeepsCompanion(t *testing.T) {
 	auto := withIcloud(ev(mkt(200), "auto", 80, 12, true), 88, 10, 60)
 	events := []event{auto, ev(mkt(197), "manual", 0, 0, false)}
 
-	a := analyze(events, 14*24*time.Hour, now, 100)
+	a := analyze(events, 14*24*time.Hour, now, 100, testSecondGate)
 	if a.CloseFails != 1 || a.FarFails != 0 {
 		t.Errorf("close=%d far=%d, want 1/0", a.CloseFails, a.FarFails)
 	}
@@ -313,7 +316,7 @@ func TestAnalyzeStaleIcloudIgnored(t *testing.T) {
 	auto := withIcloud(ev(mkt(200), "auto", 80, 12, true), 400, 320, 20*60)
 	events := []event{auto, ev(mkt(197), "manual", 0, 0, false)}
 
-	a := analyze(events, 14*24*time.Hour, now, 100)
+	a := analyze(events, 14*24*time.Hour, now, 100, testSecondGate)
 	if a.CloseFails != 1 || a.FarFails != 0 {
 		t.Errorf("close=%d far=%d, want 1/0 (stale iCloud3 ignored)", a.CloseFails, a.FarFails)
 	}
@@ -329,4 +332,32 @@ func findLever(adj []adjustment, lever string) *adjustment {
 		}
 	}
 	return nil
+}
+
+func TestParseDoors(t *testing.T) {
+	steps, err := parseDoors("1001:Front Door:9:90, 1002:2nd Gate:17,1003")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []unlockStep{
+		{doorID: 1001, name: "Front Door", reLockInterval: 9 * time.Second, holdDuration: 90 * time.Second},
+		{doorID: 1002, name: "2nd Gate", reLockInterval: 17 * time.Second},
+		{doorID: 1003, name: "1003", reLockInterval: defaultReLockInterval},
+	}
+	if len(steps) != len(want) {
+		t.Fatalf("got %d doors, want %d", len(steps), len(want))
+	}
+	for i := range want {
+		if steps[i] != want[i] {
+			t.Errorf("door %d = %+v, want %+v", i, steps[i], want[i])
+		}
+	}
+}
+
+func TestParseDoorsRejectsBadInput(t *testing.T) {
+	for _, raw := range []string{"", " , ", "abc", "0", "1001:x:0", "1001:x:9:-1", "1001:x:9:90:extra"} {
+		if _, err := parseDoors(raw); err == nil {
+			t.Errorf("parseDoors(%q) = nil error, want error", raw)
+		}
+	}
 }

@@ -28,6 +28,7 @@ Set these as environment variables or in a `.env` file. Don't commit `.env`.
 | `BUTTERFLYMX_API_TOKEN` | yes | | ButterflyMX API token |
 | `API_KEY` | yes | | Shared key clients send as `X-API-Key` (or `?key=`) |
 | `HOME_LAT`, `HOME_LON` | yes | | Geofence center |
+| `DOORS` | yes | | Doors to unlock, in order (see below) |
 | `GEOFENCE_RADIUS_M` | | 200 | Geofence radius |
 | `COOLDOWN_MINUTES` | | 10 | Minimum time between automatic unlocks |
 | `GATE_DELAY_SECONDS` | | 30 | Delay before the second gate unlocks |
@@ -40,7 +41,23 @@ Set these as environment variables or in a `.env` file. Don't commit `.env`.
 | `TUNE_WINDOW_DAYS` | | 14 | How much history the tuner looks at |
 | `ARRIVAL_LOG_PATH`, `EVENT_LOG_PATH`, `TUNER_STATE_PATH`, `TUNING_LOG_PATH` | | `arrivals.csv`, `events.csv`, `tuner_state.json`, `tuning.log` | Where runtime data is written |
 
-Door IDs and per-door timings are set in the `sequence` in `main.go`.
+### Doors
+
+`DOORS` is a comma-separated list of one or more doors, unlocked in the order
+listed. Each entry is `id[:name[:relock_s[:hold_s]]]`:
+
+- `id`: ButterflyMX door ID. `GET /status` lists your building's doors.
+- `name`: label for logs and `/doors`. Defaults to the ID.
+- `relock_s`: how often the door is re-unlocked while being held open. Must be
+  shorter than the door's hardware relock time. Defaults to 9.
+- `hold_s`: how long to hold this door open. Defaults to `UNLOCK_DURATION_SECONDS`.
+
+The second door, if there is one, waits `GATE_DELAY_SECONDS` before it unlocks.
+Any doors after that unlock right after the second one.
+
+```sh
+DOORS="1001:Front Door:9:90,1002:2nd Gate:17"
+```
 
 ## API
 

@@ -101,6 +101,12 @@ func main() {
 	}
 	haToken := os.Getenv("HA_TOKEN")
 
+	sequence, err := parseDoors(mustEnv("DOORS"))
+	if err != nil {
+		slog.Error("invalid DOORS", "err", err)
+		os.Exit(1)
+	}
+
 	client := butterflymx.NewAPIClient(butterflymx.APIStaticToken(apiToken), nil)
 
 	ctx := context.Background()
@@ -144,11 +150,8 @@ func main() {
 		tuneWindow:        time.Duration(tuneWindowDays * float64(24*time.Hour)),
 		haURL:             haURL,
 		haToken:           haToken,
-		sequence: []unlockStep{
-			{doorID: 13723, name: "Front Door", delay: 0, reLockInterval: 9 * time.Second, holdDuration: 90 * time.Second}, // hardware lock: 10s; 90s covers worst-case walk from zone trigger to front gate
-			{doorID: 15238, name: "2nd Gate", delay: 0, reLockInterval: 17 * time.Second},                                  // hardware lock: 20s; holds for full unlockDuration
-		},
-		approach: approachState{wasOutside: true},
+		sequence:          sequence,
+		approach:          approachState{wasOutside: true},
 	}
 
 	// Upgrade any pre-iCloud3 events.csv to the current schema before writing.
@@ -196,14 +199,22 @@ func main() {
 	}
 }
 
-// handleDoors returns the static door list.
+// handleDoors returns the configured door list.
 func (s *server) handleDoors(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusOK, map[string]any{
-		"doors": []map[string]any{
-			{"id": "13723", "name": "Front Door", "online": true},
-			{"id": "15238", "name": "2nd Gate", "online": true},
-		},
-	})
+	doors := make([]map[string]any, len(s.sequence))
+	for i, step := range s.sequence {
+		doors[i] = map[string]any{"id": strconv.Itoa(int(step.doorID)), "name": step.name, "online": true}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"doors": doors})
+}
+
+// secondGateID returns the door ID of the second step in the sequence (the one
+// staggered by gate_delay), or "" when only one door is configured.
+func (s *server) secondGateID() string {
+	if len(s.sequence) < 2 {
+		return ""
+	}
+	return strconv.Itoa(int(s.sequence[1].doorID))
 }
 
 // handleStatus fetches live door status from the ButterflyMX API.
@@ -255,8 +266,8 @@ func (s *server) handleStatus(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleUnlock unlocks one or more comma-separated door IDs immediately.
-// POST /unlock/13723
-// POST /unlock/13723,15238
+// POST /unlock/1001
+// POST /unlock/1001,1002
 func (s *server) handleUnlock(w http.ResponseWriter, r *http.Request) {
 	raw := r.PathValue("doors")
 	parts := strings.Split(raw, ",")
@@ -792,6 +803,58 @@ func clientIP(r *http.Request) string {
 		return ip
 	}
 	return r.RemoteAddr
+}
+
+// defaultReLockInterval is used when a DOORS entry omits relock_s. It must be
+// shorter than the door's hardware lock duration.
+const defaultReLockInterval = 9 * time.Second
+
+// parseDoors parses DOORS: a comma-separated list of doors in unlock order,
+// each "id[:name[:relock_s[:hold_s]]]". relock_s is how often the door is
+// re-unlocked while held (must be < its hardware lock duration); hold_s
+// overrides the global unlock duration for that door. The second door, if any,
+// is staggered by gate_delay.
+//
+//	DOORS="1001:Front Door:9:90,1002:2nd Gate:17"
+func parseDoors(raw string) ([]unlockStep, error) {
+	var steps []unlockStep
+	for i, entry := range strings.Split(raw, ",") {
+		entry = strings.TrimSpace(entry)
+		if entry == "" {
+			continue
+		}
+		f := strings.Split(entry, ":")
+		if len(f) > 4 {
+			return nil, fmt.Errorf("door %d %q: want id[:name[:relock_s[:hold_s]]]", i+1, entry)
+		}
+		id, err := strconv.Atoi(strings.TrimSpace(f[0]))
+		if err != nil || id <= 0 {
+			return nil, fmt.Errorf("door %d %q: invalid id", i+1, entry)
+		}
+		step := unlockStep{doorID: butterflymx.ID(id), name: f[0], reLockInterval: defaultReLockInterval}
+		if len(f) > 1 && strings.TrimSpace(f[1]) != "" {
+			step.name = strings.TrimSpace(f[1])
+		}
+		if len(f) > 2 && strings.TrimSpace(f[2]) != "" {
+			v, err := strconv.ParseFloat(strings.TrimSpace(f[2]), 64)
+			if err != nil || v <= 0 {
+				return nil, fmt.Errorf("door %d %q: invalid relock_s", i+1, entry)
+			}
+			step.reLockInterval = time.Duration(v * float64(time.Second))
+		}
+		if len(f) > 3 && strings.TrimSpace(f[3]) != "" {
+			v, err := strconv.ParseFloat(strings.TrimSpace(f[3]), 64)
+			if err != nil || v < 0 {
+				return nil, fmt.Errorf("door %d %q: invalid hold_s", i+1, entry)
+			}
+			step.holdDuration = time.Duration(v * float64(time.Second))
+		}
+		steps = append(steps, step)
+	}
+	if len(steps) == 0 {
+		return nil, fmt.Errorf("no doors configured")
+	}
+	return steps, nil
 }
 
 func mustEnv(key string) string {
