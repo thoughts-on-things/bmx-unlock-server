@@ -1,2 +1,12 @@
 bmx-unlock-server
 bmx-unloc
+
+# secrets
+.env
+
+# runtime data (contains location history)
+arrivals.csv
+events.csv
+tuner_state.json
+tuning.log
+server.log
